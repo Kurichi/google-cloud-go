@@ -60,6 +60,44 @@ func (ct *CreateTable) clearOffset() {
 	ct.Position.Offset = 0
 }
 
+// CreateQueue represents a CREATE QUEUE statement.
+type CreateQueue struct {
+	Name              ID
+	IfNotExists       bool
+	Columns           []ColumnDef
+	PrimaryKey        []KeyPart
+	Interleave        *QueueInterleave
+	RowDeletionPolicy *RowDeletionPolicy
+	Options           QueueOptions
+
+	Position Position // position of the "CREATE" token
+}
+
+func (cq *CreateQueue) String() string { return fmt.Sprintf("%#v", cq) }
+func (*CreateQueue) isDDLStmt()        {}
+func (cq *CreateQueue) Pos() Position  { return cq.Position }
+func (cq *CreateQueue) clearOffset() {
+	for i := range cq.Columns {
+		cq.Columns[i].clearOffset()
+	}
+	cq.Position.Offset = 0
+}
+
+// QueueInterleave represents an INTERLEAVE IN or INTERLEAVE IN PARENT clause.
+type QueueInterleave struct {
+	Table    ID
+	InParent bool
+	OnDelete *OnDelete
+}
+
+// QueueOptions represents the OPTIONS clause of a CREATE QUEUE statement.
+type QueueOptions struct {
+	ReceiveMode     *string
+	DisableSend     *bool
+	DisableDelivery *bool
+	LocalityGroup   *string
+}
+
 // TableConstraint represents a constraint on a table.
 type TableConstraint struct {
 	Name       ID // may be empty
@@ -509,8 +547,8 @@ type UpdateItem struct {
 	Value  Expr // or nil for DEFAULT
 }
 
-// ColumnDef represents a column definition as part of a CREATE TABLE
-// or ALTER TABLE statement.
+// ColumnDef represents a column definition as part of a CREATE TABLE,
+// ALTER TABLE, or CREATE QUEUE statement.
 type ColumnDef struct {
 	Name    ID
 	Type    Type

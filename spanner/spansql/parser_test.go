@@ -2729,6 +2729,145 @@ func TestParseDDL(t *testing.T) {
 	}
 }
 
+func TestParseCreateQueue(t *testing.T) {
+	const ddl = `CREATE QUEUE IF NOT EXISTS UserTasks (
+  UserId INT64 NOT NULL,
+  ShardId INT64 AS (ABS(UserId)) STORED HIDDEN,
+  CreatedAt TIMESTAMP HIDDEN OPTIONS (allow_commit_timestamp = TRUE),
+  UpdatedAt TIMESTAMP OPTIONS (allow_commit_timestamp = NULL),
+  Payload JSON NOT NULL HIDDEN
+) PRIMARY KEY (UserId, ShardId DESC, CreatedAt, UpdatedAt),
+  INTERLEAVE IN PARENT Users ON DELETE CASCADE,
+  ROW DELETION POLICY (OLDER_THAN (CreatedAt, INTERVAL 30 DAY)),
+  OPTIONS (disable_delivery = true, receive_mode = 'PULL', locality_group = 'QueueStorage', disable_send = false)`
+
+	stmt, err := ParseDDLStmt(ddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt.clearOffset()
+
+	cascade := CascadeOnDelete
+	want := &CreateQueue{
+		Name:        "UserTasks",
+		IfNotExists: true,
+		Columns: []ColumnDef{
+			{Name: "UserId", Type: Type{Base: Int64}, NotNull: true, Position: Position{Line: 2}},
+			{
+				Name: "ShardId", Type: Type{Base: Int64}, Hidden: true, Position: Position{Line: 3},
+				Generated: Func{Name: "ABS", Args: []Expr{ID("UserId")}},
+			},
+			{
+				Name: "CreatedAt", Type: Type{Base: Timestamp}, Hidden: true, Position: Position{Line: 4},
+				Options: ColumnOptions{AllowCommitTimestamp: boolAddr(true)},
+			},
+			{
+				Name: "UpdatedAt", Type: Type{Base: Timestamp}, Position: Position{Line: 5},
+				Options: ColumnOptions{AllowCommitTimestamp: boolAddr(false)},
+			},
+			{Name: "Payload", Type: Type{Base: JSON}, NotNull: true, Hidden: true, Position: Position{Line: 6}},
+		},
+		PrimaryKey:        []KeyPart{{Column: "UserId"}, {Column: "ShardId", Desc: true}, {Column: "CreatedAt"}, {Column: "UpdatedAt"}},
+		Interleave:        &QueueInterleave{Table: "Users", InParent: true, OnDelete: &cascade},
+		RowDeletionPolicy: &RowDeletionPolicy{Column: "CreatedAt", NumDays: 30},
+		Options: QueueOptions{
+			ReceiveMode: stringAddr("PULL"), DisableSend: boolAddr(false), DisableDelivery: boolAddr(true), LocalityGroup: stringAddr("QueueStorage"),
+		},
+		Position: Position{Line: 1},
+	}
+	if !reflect.DeepEqual(stmt, want) {
+		t.Fatalf("ParseDDLStmt produced\n%#v\nwant\n%#v", stmt, want)
+	}
+
+	sql := stmt.SQL()
+	reparsed, err := ParseDDLStmt(sql)
+	if err != nil {
+		t.Fatalf("ParseDDLStmt(%q): %v", sql, err)
+	}
+	reparsed.clearOffset()
+	if !reflect.DeepEqual(reparsed, want) {
+		t.Fatalf("round trip through %q produced\n%#v\nwant\n%#v", sql, reparsed, want)
+	}
+
+	schema, err := ParseDDL("schema.sql", "CREATE TABLE Users (UserId INT64 NOT NULL) PRIMARY KEY (UserId);\n"+sql+";")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schema.List) != 2 {
+		t.Fatalf("got %d statements, want 2", len(schema.List))
+	}
+	if got, ok := schema.List[1].(*CreateQueue); !ok || got.Name != "UserTasks" || got.Pos().Line != 2 {
+		t.Errorf("unexpected queue in schema: %#v", schema.List[1])
+	}
+}
+
+func TestCreateQueueInterleave(t *testing.T) {
+	const prefix = "CREATE QUEUE UserTasks (UserId INT64 NOT NULL, payload BYTES(MAX) NOT NULL) PRIMARY KEY (UserId)"
+	noAction := NoActionOnDelete
+	for _, tc := range []struct {
+		clause string
+		want   *QueueInterleave
+	}{
+		{"", nil},
+		{", INTERLEAVE IN Users", &QueueInterleave{Table: "Users"}},
+		{", INTERLEAVE IN `Parent`", &QueueInterleave{Table: "Parent"}},
+		{", INTERLEAVE IN PARENT Users ON DELETE NO ACTION", &QueueInterleave{Table: "Users", InParent: true, OnDelete: &noAction}},
+	} {
+		t.Run(tc.clause, func(t *testing.T) {
+			stmt, err := ParseDDLStmt(prefix + tc.clause)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sql := stmt.SQL()
+			reparsed, err := ParseDDLStmt(sql)
+			if err != nil {
+				t.Fatalf("ParseDDLStmt(%q): %v", sql, err)
+			}
+			for _, result := range []DDLStmt{stmt, reparsed} {
+				got, ok := result.(*CreateQueue)
+				if !ok || !reflect.DeepEqual(got.Interleave, tc.want) {
+					t.Errorf("got statement %#v, want interleave %#v", result, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestParseCreateQueueInvalid(t *testing.T) {
+	const prefix = "CREATE QUEUE UserTasks (UserId INT64, Payload BYTES(MAX) NOT NULL)"
+	const ddl = prefix + " PRIMARY KEY (UserId)"
+	for _, tc := range []struct {
+		name string
+		ddl  string
+	}{
+		{"missing payload", "CREATE QUEUE UserTasks (UserId INT64) PRIMARY KEY (UserId)"},
+		{"nullable payload", "CREATE QUEUE UserTasks (UserId INT64, Payload JSON) PRIMARY KEY (UserId)"},
+		{"invalid payload type", "CREATE QUEUE UserTasks (UserId INT64, Payload ARRAY<JSON> NOT NULL) PRIMARY KEY (UserId)"},
+		{"duplicate payload", "CREATE QUEUE UserTasks (UserId INT64, Payload JSON NOT NULL, payload JSON NOT NULL) PRIMARY KEY (UserId)"},
+		{"invalid column type", "CREATE QUEUE UserTasks (UserId 123, Payload JSON NOT NULL) PRIMARY KEY (UserId)"},
+		{"generated column without stored", "CREATE QUEUE UserTasks (UserId INT64 AS (1) HIDDEN, Payload JSON NOT NULL) PRIMARY KEY (UserId)"},
+		{"no primary key", prefix},
+		{"empty primary key", prefix + " PRIMARY KEY ()"},
+		{"unclosed primary key", prefix + " PRIMARY KEY (UserId"},
+		{"missing interleave table", ddl + ", INTERLEAVE IN PARENT"},
+		{"empty options", ddl + ", OPTIONS ()"},
+		{"unclosed options", ddl + ", OPTIONS (disable_send = false"},
+		{"unknown option", ddl + ", OPTIONS (enabled = true)"},
+		{"wrong option type", ddl + ", OPTIONS (disable_send = 'true')"},
+		{"invalid receive mode", ddl + ", OPTIONS (receive_mode = 'PUSH')"},
+		{"duplicate option", ddl + ", OPTIONS (disable_send = true, DISABLE_SEND = false)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseDDLStmt(tc.ddl); err == nil {
+				t.Errorf("ParseDDLStmt accepted %q", tc.ddl)
+			}
+			if _, err := ParseDDL("schema.sql", tc.ddl); err == nil {
+				t.Errorf("ParseDDL accepted %q", tc.ddl)
+			}
+		})
+	}
+}
+
 func TestParseDML(t *testing.T) {
 	tests := []struct {
 		in   string
